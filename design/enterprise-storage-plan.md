@@ -26,6 +26,7 @@ scratch/execution cache, so Hermes deploys as **stateless containers** that scal
 | D3 | Cron / kanban / ledgers | Migrated to postgres **later** through the same facade ops-tables surface (Phase 4). |
 | D4 | Container mode | Postgres-primary. **No local write-ahead cache** — scratch is disposable, reads go straight to PG through the facade. |
 | D5 | Tenant isolation | **Per-tenant schema** (one schema per profile/tenant) + shared `public` catalog. No RLS, no `tenant_id` columns. |
+| D6 | Vector search | **pgvector** enabled on the postgres backend. Search is hybrid: tsvector (lexical) + pgvector (semantic). |
 
 ## 3. Non-goals
 
@@ -135,7 +136,9 @@ StorageBackend
                load(snapshot_id) -> pinned refs              # read-only, immutable
   sessions:    append_message / load_transcript / rewrite(transcript)  # compression path
                usage(record) / usage(query)
-  search:      text(query, filters) -> hits                   # FTS
+  search:      text(query, filters) -> hits                   # lexical (tsvector)
+               semantic(query, kind, k) -> hits                # pgvector KNN
+               hybrid(query, filters) -> hits                  # fused (RRF)
   ops:         generic transactional table access for
                cron jobs/executions/deliveries/notepad, kanban, ledgers
   locks:       advisory(name, timeout) -> token               # replaces file locks
@@ -169,6 +172,7 @@ tenant_<x>/                                           # one schema per tenant
   snapshots(id, refs jsonb, created_at)
   sessions / messages / session_model_usage          # from hermes_state_schema.py
   fts: generated tsvector columns; pg_trgm for fuzzy (mirrors FTS5 trigram probe)
+  embeddings(target_kind, target_ref, version, model, dim, vector)  # pgvector
   cron_jobs / cron_executions / cron_deliveries / cron_notepad
   kanban_boards / kanban_cards
   ledger_delivery / ledger_lifecycle / hosted_room_* (as census dictates)
@@ -181,7 +185,20 @@ tenant_<x>/                                           # one schema per tenant
 - Tenant deletion (GDPR) = `DROP SCHEMA tenant_<x> CASCADE` — no row-scrubbing.
 - Cross-tenant admin queries loop schemas (accepted trade-off of D5).
 - Migrations: one canonical set, versioned; runner applies to `public` + every tenant
-  schema; tracked in `migration_state`.
+  schema; tracked in `migration_state`. Requires `vector` extension (created at
+  provisioning; host must offer pgvector — D6).
+
+### 8.1 Embedding pipeline (D6)
+
+- **Write-time:** persisting a message/document enqueues its embedding as a background
+  job (auxiliary-client pattern; the repo proxy already forwards `/embeddings` to
+  providers) — the write path never blocks on the embedding API.
+- **Read-time:** embed the query once, pgvector KNN over `embeddings`.
+- **Hybrid:** lexical + vector fused (reciprocal rank fusion; weights in `config.yaml`).
+- **Model pinning:** `model` + `dim` recorded per row; switching embedding model is a
+  recorded version change with a backfill (re-embed) job, never a silent overwrite.
+- **Config:** embedding model/endpoint in `config.yaml` (behavior); API keys in `.env`
+  / container env. Prompt caching unaffected — embeddings are read-side search only.
 
 ## 9. Prompt-cache safety: snapshot pinning
 
@@ -276,10 +293,12 @@ Semantics:
 ### Phase 2 — Postgres: sessions + search
 - `PostgresBackend`: tenant→schema resolver, pool, migrations runner, provisioning.
 - Sessions/messages/usage tables; append/load/rewrite paths.
-- FTS5 → tsvector + pg_trgm; search parity test (same queries, same rank order).
-- `hermes migrate` for `state.db` (two-pass, verify).
-- **Exit:** full agent turns E2E in PG mode against temp `HERMES_HOME`; search parity;
-  migration verified on a real home.
+- FTS5 → tsvector + pg_trgm; lexical parity test (same queries, same rank order).
+- pgvector (D6): `embeddings` table, write-time background embedding pipeline,
+  query-time KNN, hybrid (RRF) ranking, model/dim config + pinning.
+- `hermes migrate` for `state.db` (two-pass, verify; embeddings backfilled post-import).
+- **Exit:** full agent turns E2E in PG mode against temp `HERMES_HOME`; lexical parity +
+  semantic search working; migration verified on a real home.
 
 ### Phase 3 — Content store
 - `documents` + versions + checksums; SOUL/skills/`memories`/config → documents surface.
@@ -329,3 +348,5 @@ Sequencing note: a single-replica container deployment can ship after Phases 2+3
 5. **Multi-region / DR** — required for v1 or backlog?
 6. **Per-tenant metering/billing** — usage data exists (`session_model_usage`); who reads it, cross-tenant?
 7. **Honcho/external providers in container mode** — egress allowances, credential rotation.
+8. **Embedding model choice** — which provider/model via the proxy (dims, cost per
+   message at scale), and the backfill strategy for model swaps (D6).
