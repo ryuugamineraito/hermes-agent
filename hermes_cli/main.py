@@ -269,6 +269,7 @@ from hermes_cli.subcommands.whatsapp import build_whatsapp_parser, build_whatsap
 from hermes_cli.subcommands.slack import build_slack_parser
 from hermes_cli.subcommands.login import build_login_parser
 from hermes_cli.subcommands.logout import build_logout_parser
+from hermes_cli.subcommands.storage import build_storage_parser
 from hermes_cli.subcommands.auth import build_auth_parser
 from hermes_cli.subcommands.status import build_status_parser
 from hermes_cli.subcommands.pause import build_pause_parser
@@ -3261,6 +3262,7 @@ def _build_cli_parser():
     build_curator_parser(subparsers)
     build_pets_parser(subparsers)
     build_clipboard_parser(subparsers)
+    build_storage_parser(subparsers)
     build_journey_parser(subparsers)
     build_memory_parser(subparsers, cmd_memory=cmd_memory)
     build_tools_parser(subparsers, cmd_tools=cmd_tools)

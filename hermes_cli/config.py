@@ -527,6 +527,15 @@ def seed_config_file(config_path: Path, template: Optional[Path] = None) -> bool
 def _ensure_default_soul_md(home: Path) -> None:
     """Seed DEFAULT_SOUL_MD on first run; upgrade a legacy comment-only scaffold in place.
     A SOUL.md the user actually customized is never touched."""
+    from hermes_constants import profile_name_for_home
+    from storage import get_backend
+    backend = get_backend(tenant=profile_name_for_home(home))
+    if backend is not None:
+        # postgres mode: the identity document lives in the tenant schema; seed once, never
+        # through a file (the file is not the source of truth there).
+        if backend.get_document("SOUL", "SOUL.md") is None:
+            backend.put_document("SOUL", "SOUL.md", DEFAULT_SOUL_MD, created_by="seed")
+        return
     soul_path = home / "SOUL.md"
     if soul_path.exists():
         try:

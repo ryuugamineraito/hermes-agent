@@ -1509,6 +1509,33 @@ def _omitted_headings(content: str, start: int, end: int, limit: int = 15) -> li
     return headings[:limit] + (["..."] if len(headings) > limit else [])
 
 
+def _soul_content_source(home: Path, soul_path: Path) -> tuple[Optional[str], bool, str]:
+    """(content, user_authored, read_path); content None = no identity document.
+
+    postgres mode: SOUL.md lives in the tenant schema's documents table — the DB is the
+    source of truth and the content is user-owned (nothing distribution-planted writes
+    to the DB), so no manifest trust check. Local mode: the file, with the
+    distribution-manifest trust check (``profile install`` plants third-party SOUL.md).
+    """
+    from hermes_constants import profile_name_for_home
+    from storage import get_backend
+    backend = get_backend(tenant=profile_name_for_home(home))
+    if backend is not None:
+        doc = backend.get_document("SOUL", "SOUL.md")
+        return (doc.content if doc else None), True, f"storage:{backend.tenant}/SOUL.md"
+    if not soul_path.exists():
+        return None, True, str(soul_path)
+    from hermes_cli.profile_distribution import read_manifest
+    try:
+        manifest = read_manifest(soul_path.parent)
+        user_authored = manifest is None or (bool(manifest.distribution_owned)
+                                             and "SOUL.md" not in manifest.distribution_owned)
+    except Exception as e:  # unparseable manifest is still a distribution: fail closed
+        logger.debug("Could not read distribution manifest next to %s: %s", soul_path, e)
+        user_authored = False
+    return (_read_text_with_timeout(soul_path) or ""), user_authored, str(soul_path)
+
+
 def load_soul_md(context_length: Optional[int] = None, home_override: Path | None = None) -> Optional[str]:
     """SOUL.md from HERMES_HOME (identity slot #1), or None.
 
@@ -1529,11 +1556,14 @@ def load_soul_md(context_length: Optional[int] = None, home_override: Path | Non
         ensure_hermes_home()
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
-    soul_path = (Path(home_override) if home_override is not None else get_hermes_home()) / "SOUL.md"
-    if not soul_path.exists():
-        return None
+    home = Path(home_override) if home_override is not None else get_hermes_home()
+    soul_path = home / "SOUL.md"
+    read_path = str(soul_path)
     try:
-        content = (_read_text_with_timeout(soul_path) or "").strip()
+        content, user_authored, read_path = _soul_content_source(home, soul_path)
+        if content is None:
+            return None
+        content = content.strip()
         if content:
             # Plugin-era desktop builds appended a frozen Bot Mode roster to SOUL.md; the server
             # now injects the live section in Bot Chat only, so the copy is dead weight everywhere.
@@ -1541,22 +1571,10 @@ def load_soul_md(context_length: Optional[int] = None, home_override: Path | Non
             content = strip_legacy_protocol(content).strip()
         if not content:
             return None
-        # `hermes profile install <git-url>` / `profile update` plant a third-party SOUL.md into a
-        # distribution profile (hermes_cli/profile_distribution.py, DEFAULT_DIST_OWNED) with no scan and no
-        # approval gate, so it is NOT the user's own file: when distribution.yaml owns SOUL.md (a manifest
-        # with no `distribution_owned` list owns the whole payload) a scanner hit keeps BLOCKING.
-        from hermes_cli.profile_distribution import read_manifest
-        try:
-            manifest = read_manifest(soul_path.parent)
-            user_authored = manifest is None or (bool(manifest.distribution_owned)
-                                                 and "SOUL.md" not in manifest.distribution_owned)
-        except Exception as e:  # unparseable manifest is still a distribution: fail closed
-            logger.debug("Could not read distribution manifest next to %s: %s", soul_path, e)
-            user_authored = False
         return _truncate_content(_scan_context_content(content, "SOUL.md", user_authored=user_authored), "SOUL.md",
-                                 context_length=context_length, read_path=str(soul_path))
+                                 context_length=context_length, read_path=read_path)
     except Exception as e:
-        logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
+        logger.debug("Could not read SOUL.md from %s: %s", read_path, e)
         return None
 
 

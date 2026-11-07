@@ -233,6 +233,14 @@ uvloop = [
 # Native Anthropic provider — only needed when provider=anthropic (not via
 # OpenRouter or other aggregators).
 anthropic = ["anthropic==0.125.0"] # CVE-2026-34450, CVE-2026-34452
+# Enterprise storage — Postgres backend (storage.backend=postgres in config.yaml).
+# Not needed by every session: the default local backend is stdlib + files only.
+postgres = [
+  "sqlalchemy==2.1.7",
+  # Pure-Python driver (py3-none-any): the [binary] wheel set has no coverage for
+  # every locked platform, which breaks PM's universal `uv lock` resolution.
+  "psycopg==3.3.7",
+]
 # Web search backends — each only loaded when the user picks it as their
 # search provider (configured via `hermes tools` or config.yaml).
 exa = ["exa-py==2.26.0"]
