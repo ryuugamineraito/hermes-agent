@@ -1,6 +1,6 @@
 # Hermes Enterprise Storage — Detailed Plan
 
-Status: **brainstorm / design (no implementation)** · Phase 0 input
+Status: **Phase 1 increment shipped** (commit `f709cc6a78`, branch `enterprise-storage-plan`, 2026-11-07) — facade + Postgres backend + SOUL.md as first document consumer, live-verified. See §2.1 for as-built notes.
 Decisions locked in brainstorm 2025-07; see §2.
 
 ## 1. Motivation
@@ -27,6 +27,26 @@ scratch/execution cache, so Hermes deploys as **stateless containers** that scal
 | D4 | Container mode | Postgres-primary. **No local write-ahead cache** — scratch is disposable, reads go straight to PG through the facade. |
 | D5 | Tenant isolation | **Per-tenant schema** (one schema per profile/tenant) + shared `public` catalog. No RLS, no `tenant_id` columns. |
 | D6 | Vector search | **pgvector** enabled on the postgres backend. Search is hybrid: tsvector (lexical) + pgvector (semantic). |
+
+## 2.1 Implementation status — as built (Phase 1 increment, `f709cc6a78`)
+
+**Shipped:**
+- `storage/` package: `base` (frozen `Document`, `StorageBackend` ABC), `config` (`storage:` section), `schema` (v1 migrations), `postgres` (SQLAlchemy Core + psycopg, tenant-pinned `search_path`, self-provisioning on construction).
+- **Local mode has no `LocalBackend` class** (deviation from §7, deliberate): `get_backend()` returns `None` and callers keep the existing file/SQLite paths unchanged — zero behavior change by construction, zero new code on the hot path. This satisfies the original Phase 1 exit (no behavior/perf change) with less surface than a delegating class.
+- `hermes storage` CLI: `status` / `provision` / `soul show|set|import` (DSN redacted; `soul show` falls back to the local file in local mode).
+- **SOUL.md is the first document consumer** (originally Phase 3): postgres mode reads the identity document from `tenant_<x>.documents` at session-start prompt build (same timing as today's file read → per-conversation prompt caching untouched), and `hermes_cli/config.py` seeds the default SOUL into the DB instead of a file. Postgres-mode SOUL.md is **user-owned**: the DB is the source of truth and nothing distribution-planted writes to it, so no manifest trust check; local mode keeps the distribution-manifest check byte-for-byte.
+- `documents` table as built (refines §8): `kind, key, version, content, meta jsonb, checksum, created_by, created_at timestamptz`, PK `(kind, key, version)`, append-only. `superseded_by` from §8 **not created** (YAGNI until rollback/admin versioning lands).
+- `[postgres]` extra: `sqlalchemy==2.1.7`, `psycopg==3.3.7` **pure-Python wheel** — the `[binary]` wheel set has no coverage for every locked platform and breaks PM's universal `uv lock`. Pins respect the supply-chain cutoff `2026-11-04T08:27:04Z` (newer psycopg exists but postdates it).
+- Tests: config/schema unit tests, CLI tests, and **live Postgres integration tests** gated on `HERMES_STORAGE_TEST_DSN` (skipped cleanly without it; `scripts/run_tests.sh` now forwards the var). Canonical regression: 344 passed / 0 failed, live tests green against a real pgvector instance; E2E CLI verified end-to-end (`status` → `ready: true`, `soul set` → version bump, `soul show` → readback).
+
+**Implementation decisions that constrained the code (keep these when extending):**
+- `get_storage_config()` never calls `load_config()`: that takes the **non-reentrant** config lock and runs `ensure_hermes_home()` (which seeds SOUL → `get_backend` → recursion/deadlock). It reads the **frozen worker config snapshot first** (safe-worker audit contract: bound workers never read `config.yaml` from disk), then a raw lock-free `read_config_doc`. Missing/unreadable/invalid `storage:` section → local mode; only section-parsing errors raise.
+- Teardown hygiene (see segfault note below): `atexit`-registered idempotent `close()` on every backend; the `hermes storage` CLI disposes the pool in a `finally` before interpreter finalization; the `connect` event listener captures only strings (no engine↔backend reference cycle).
+- `uv.lock` was refreshed with plain `uv lock` in the dev sandbox (PM runtime not provisioned there) — re-run `hermes pm lock` in a full environment before merge if the lockfile policy requires it.
+
+**Known environmental issue (not a code defect — root-caused, evidence in commit message):** a one-shot process using psycopg 3.3.7 on the WSL2 dev box can SIGSEGV *after* completing, during C-extension finalization. Measured: ~3%/run on the native filesystem, ~25%/run from a `/mnt/d` (drvfs) mount, **0/60 with the pure-Python pg8000 driver running the identical workload**, and the fault never occurs while any SIGSEGV handler is installed (signature of a library finalization race, not an application memory bug). Output and data are always correct. Containers on native filesystems + the long-lived agent process are not the exposed surface. Watch for a psycopg bump once 3.3.8 clears the supply-chain cutoff.
+
+**Still to do (maps to §13):** sessions/messages/search + `hermes migrate` (Phase 2), skills/memories/config → documents + snapshot pinning (§9, Phase 3), ops tables (Phase 4), container hardening (Phase 5).
 
 ## 3. Non-goals
 
@@ -276,7 +296,7 @@ Semantics:
 
 ## 13. Phased plan
 
-### Phase 0 — Design freeze (docs only)
+### Phase 0 — Design freeze (docs only) — ✅ done (this doc, `b1278a4a3b`, `7b57a27221`)
 - Full store census: every sqlite path, every file artifact, every lock (validate §4).
 - Freeze `storage/` contract (§7); map every call site to a surface.
 - PG migration set v0; per-schema runner design; pooling choice (in-proc vs pgbouncer).
@@ -284,14 +304,15 @@ Semantics:
 - E2E test strategy for PG (containerized Postgres for `scripts/run_tests.sh`).
 - **Exit:** design doc reviewed; contract frozen; per-store mapping table agreed.
 
-### Phase 1 — Local backend (zero behavior change)
-- `storage/` package + `LocalBackend` delegating to existing sqlite/file code.
-- Route `hermes_state` I/O and `memory_tool` I/O through the facade.
+### Phase 1 — Local backend (zero behavior change) — ✅ done, simplified (see §2.1)
+- `storage/` package; local mode = `get_backend()` returns `None`, existing paths untouched (no `LocalBackend` class — less surface, same zero-change guarantee).
+- Routing of `hermes_state` / `memory_tool` I/O through the facade happens per-store as each store gets a postgres implementation (below), so local paths are never rewritten twice.
 - No behavior/perf change; full suite green via `scripts/run_tests.sh`.
 - **Exit:** suite green; byte-identical behavior; no added latency (measured).
 
-### Phase 2 — Postgres: sessions + search
-- `PostgresBackend`: tenant→schema resolver, pool, migrations runner, provisioning.
+### Phase 2 — Postgres: sessions + search — ⏳ in progress (backend core ✅)
+- `PostgresBackend`: tenant→schema resolver, pool, migrations runner, provisioning. ✅ (shipped in the Phase 1 increment: `storage/postgres.py` + `storage/schema.py`, self-provisioning, idempotent v1 migrations, in-process pool keyed by tenant)
+- ⏳ Remaining: sessions/messages/usage tables; append/load/rewrite paths.
 - Sessions/messages/usage tables; append/load/rewrite paths.
 - FTS5 → tsvector + pg_trgm; lexical parity test (same queries, same rank order).
 - pgvector (D6): `embeddings` table, write-time background embedding pipeline,
@@ -300,8 +321,9 @@ Semantics:
 - **Exit:** full agent turns E2E in PG mode against temp `HERMES_HOME`; lexical parity +
   semantic search working; migration verified on a real home.
 
-### Phase 3 — Content store
-- `documents` + versions + checksums; SOUL/skills/`memories`/config → documents surface.
+### Phase 3 — Content store — ⏳ partially done (SOUL.md ✅, see §2.1)
+- `documents` + versions + checksums ✅ (as-built columns in §2.1); SOUL.md → documents ✅ (read + seed paths wired).
+- ⏳ Remaining: skills/`memories`/config → documents surface.
 - Snapshot pinning at session start (§9); system prompt from pinned rows.
 - Materialize-on-demand to scratch (skill scripts, media).
 - Admin versioning: CLI commands (list/promote/rollback versions) via existing
@@ -350,3 +372,6 @@ Sequencing note: a single-replica container deployment can ship after Phases 2+3
 7. **Honcho/external providers in container mode** — egress allowances, credential rotation.
 8. **Embedding model choice** — which provider/model via the proxy (dims, cost per
    message at scale), and the backfill strategy for model swaps (D6).
+9. **psycopg 3.3.8 bump** — blocked by the supply-chain cutoff (published
+   `2026-11-04T09:37:35Z`, after the `2026-11-04T08:27:04Z` cutoff); revisit when the
+   cutoff moves, may resolve the WSL2 exit-finalization SIGSEGV noted in §2.1.
